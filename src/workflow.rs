@@ -7,6 +7,7 @@ use petgraph::graph::{DiGraph, NodeIndex};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::broadcast;
+use tracing::{debug, info, info_span, warn, Instrument};
 
 use crate::status::{PipelineStatus, StageStatusEntry};
 use crate::{Result, Stage, StateStore, TreadleError, WorkflowEvent};
@@ -411,7 +412,8 @@ impl Workflow {
         item: &dyn crate::WorkItem,
         store: &mut S,
     ) -> Result<()> {
-        self.advance_internal(item, store, 0).await
+        let span = info_span!("advance", item_id = %item.id());
+        self.advance_internal(item, store, 0).instrument(span).await
     }
 
     /// Internal recursive advance with depth tracking.
@@ -424,21 +426,28 @@ impl Workflow {
         // Safety limit to prevent infinite recursion
         const MAX_DEPTH: usize = 100;
         if depth > MAX_DEPTH {
+            warn!("maximum recursion depth exceeded");
             return Err(TreadleError::StageExecution(
                 "maximum recursion depth exceeded".to_string(),
             ));
         }
 
+        debug!(depth = depth, "checking for ready stages");
+
         let ready_stages = self.ready_stages(item.id(), store).await?;
         if ready_stages.is_empty() {
+            debug!("no ready stages");
             // Check if complete
             if self.is_complete(item.id(), store).await? {
+                info!("workflow complete");
                 self.emit(WorkflowEvent::WorkflowCompleted {
                     item_id: item.id().to_string(),
                 });
             }
             return Ok(());
         }
+
+        debug!(ready = ?ready_stages, "found ready stages");
 
         let mut made_progress = false;
 
@@ -494,52 +503,69 @@ impl Workflow {
         stage_name: &str,
         store: &mut S,
     ) -> Result<crate::StageOutcome> {
-        let stage = self.get_stage(stage_name)?;
-        let item_id = item.id();
+        let span = info_span!("stage", stage = %stage_name);
 
-        // Load existing state or create new one
-        let mut state = store
-            .get_stage_state(item_id, stage_name)
-            .await?
-            .unwrap_or_else(crate::StageState::new);
+        async {
+            info!("executing stage");
 
-        // Mark as in progress (preserves retry_count from any previous attempts)
-        state.mark_in_progress();
-        store.save_stage_state(item_id, stage_name, &state).await?;
+            let stage = self.get_stage(stage_name)?;
+            let item_id = item.id();
 
-        // Emit start event
-        self.emit(WorkflowEvent::StageStarted {
-            item_id: item_id.to_string(),
-            stage: stage_name.to_string(),
-        });
+            // Load existing state or create new one
+            let mut state = store
+                .get_stage_state(item_id, stage_name)
+                .await?
+                .unwrap_or_else(crate::StageState::new);
 
-        // Build context
-        let mut ctx = crate::StageContext::new(stage_name.to_string());
-        ctx.stage_state = state.clone();
+            // Mark as in progress (preserves retry_count from any previous attempts)
+            state.mark_in_progress();
+            store.save_stage_state(item_id, stage_name, &state).await?;
 
-        // Execute the stage
-        let result = stage.execute(item, &mut ctx).await;
+            // Emit start event
+            self.emit(WorkflowEvent::StageStarted {
+                item_id: item_id.to_string(),
+                stage: stage_name.to_string(),
+            });
 
-        match result {
-            Ok(outcome) => {
-                self.handle_outcome(item, stage_name, &outcome, store).await?;
-                Ok(outcome)
+            // Build context
+            let mut ctx = crate::StageContext::new(stage_name.to_string());
+            ctx.stage_state = state.clone();
+
+            // Execute the stage
+            let result = stage.execute(item, &mut ctx).await;
+
+            match &result {
+                Ok(outcome) => {
+                    info!(outcome = ?outcome, "stage completed");
+                }
+                Err(e) => {
+                    warn!(error = %e, "stage failed");
+                }
             }
-            Err(e) => {
-                // Mark as failed
-                let error_msg = e.to_string();
-                state.mark_failed(error_msg.clone());
-                store.save_stage_state(item_id, stage_name, &state).await?;
 
-                self.emit(WorkflowEvent::StageFailed {
-                    item_id: item_id.to_string(),
-                    stage: stage_name.to_string(),
-                    error: error_msg,
-                });
+            match result {
+                Ok(outcome) => {
+                    self.handle_outcome(item, stage_name, &outcome, store).await?;
+                    Ok(outcome)
+                }
+                Err(e) => {
+                    // Mark as failed
+                    let error_msg = e.to_string();
+                    state.mark_failed(error_msg.clone());
+                    store.save_stage_state(item_id, stage_name, &state).await?;
 
-                Err(e)
+                    self.emit(WorkflowEvent::StageFailed {
+                        item_id: item_id.to_string(),
+                        stage: stage_name.to_string(),
+                        error: error_msg,
+                    });
+
+                    Err(e)
+                }
             }
         }
+        .instrument(span)
+        .await
     }
 
     /// Handles a successful stage outcome.
@@ -626,27 +652,38 @@ impl Workflow {
         subtasks: Vec<crate::SubTask>,
         store: &mut S,
     ) -> Result<bool> {
-        let item_id = item.id();
-        let stage = self.get_stage(stage_name)?;
+        let span = info_span!(
+            "fanout",
+            stage = %stage_name,
+            subtask_count = subtasks.len()
+        );
 
-        // Emit fan-out started event
-        let subtask_names: Vec<String> = subtasks.iter().map(|s| s.id.clone()).collect();
-        self.emit(WorkflowEvent::FanOutStarted {
-            item_id: item_id.to_string(),
-            stage: stage_name.to_string(),
-            subtasks: subtask_names.clone(),
-        });
+        async {
+            info!("starting fan-out execution");
 
-        let mut all_completed = true;
-        let mut any_failed = false;
+            let item_id = item.id();
+            let stage = self.get_stage(stage_name)?;
 
-        // Execute each subtask
-        for subtask in &subtasks {
-            self.emit(WorkflowEvent::SubTaskStarted {
+            // Emit fan-out started event
+            let subtask_names: Vec<String> = subtasks.iter().map(|s| s.id.clone()).collect();
+            self.emit(WorkflowEvent::FanOutStarted {
                 item_id: item_id.to_string(),
                 stage: stage_name.to_string(),
-                subtask: subtask.id.clone(),
+                subtasks: subtask_names.clone(),
             });
+
+            let mut all_completed = true;
+            let mut any_failed = false;
+
+            // Execute each subtask
+            for subtask in &subtasks {
+                debug!(subtask = %subtask.id, "executing subtask");
+
+                self.emit(WorkflowEvent::SubTaskStarted {
+                    item_id: item_id.to_string(),
+                    stage: stage_name.to_string(),
+                    subtask: subtask.id.clone(),
+                });
 
             // Build context with subtask name
             let mut ctx = crate::StageContext::new(stage_name.to_string())
@@ -693,33 +730,39 @@ impl Workflow {
             }
         }
 
-        // Update parent stage status based on subtask outcomes
-        let mut state = crate::StageState::new();
-        if any_failed {
-            state.mark_failed("one or more subtasks failed".to_string());
-            store.save_stage_state(item_id, stage_name, &state).await?;
+            // Update parent stage status based on subtask outcomes
+            let mut state = crate::StageState::new();
+            if any_failed {
+                warn!(failed_count = subtasks.len() - all_completed as usize, "fan-out had failures");
+                state.mark_failed("one or more subtasks failed".to_string());
+                store.save_stage_state(item_id, stage_name, &state).await?;
 
-            self.emit(WorkflowEvent::StageFailed {
-                item_id: item_id.to_string(),
-                stage: stage_name.to_string(),
-                error: "one or more subtasks failed".to_string(),
-            });
+                self.emit(WorkflowEvent::StageFailed {
+                    item_id: item_id.to_string(),
+                    stage: stage_name.to_string(),
+                    error: "one or more subtasks failed".to_string(),
+                });
 
-            Ok(false)
-        } else if all_completed {
-            state.mark_complete();
-            store.save_stage_state(item_id, stage_name, &state).await?;
+                Ok(false)
+            } else if all_completed {
+                info!("all subtasks completed successfully");
+                state.mark_complete();
+                store.save_stage_state(item_id, stage_name, &state).await?;
 
-            self.emit(WorkflowEvent::StageCompleted {
-                item_id: item_id.to_string(),
-                stage: stage_name.to_string(),
-            });
+                self.emit(WorkflowEvent::StageCompleted {
+                    item_id: item_id.to_string(),
+                    stage: stage_name.to_string(),
+                });
 
-            Ok(true)
-        } else {
-            // Some subtasks didn't complete normally
-            Ok(false)
+                Ok(true)
+            } else {
+                debug!("some subtasks didn't complete normally");
+                // Some subtasks didn't complete normally
+                Ok(false)
+            }
         }
+        .instrument(span)
+        .await
     }
 
     /// Resets a failed stage to pending, allowing retry.
