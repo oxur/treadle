@@ -1,3 +1,5 @@
 /target
 Cargo.lock
 /workbench
+/assets/ai/ai-rust
+.claude
