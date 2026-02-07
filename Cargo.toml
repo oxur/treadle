@@ -1,0 +1,30 @@
+[package]
+name = "treadle"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "A persistent, resumable, human-in-the-loop workflow engine backed by a petgraph DAG"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/TODO/treadle"
+documentation = "https://docs.rs/treadle"
+readme = "README.md"
+keywords = ["pipeline", "workflow", "dag", "async", "resumable"]
+categories = ["asynchronous", "data-structures"]
+
+[dependencies]
+petgraph = "0.7"
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+
+[features]
+default = ["sqlite"]
+sqlite = ["dep:rusqlite"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
