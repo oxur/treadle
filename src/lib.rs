@@ -58,6 +58,10 @@ pub mod work_item;
 pub use error::{Result, TreadleError};
 pub use stage::{ReviewData, Stage, StageContext, StageOutcome, StageState, StageStatus, SubTask};
 pub use state_store::{MemoryStateStore, StateStore};
+
+#[cfg(feature = "sqlite")]
+pub use state_store::SqliteStateStore;
+
 pub use work_item::WorkItem;
 
 /// Treadle is under active development. See the README for the design

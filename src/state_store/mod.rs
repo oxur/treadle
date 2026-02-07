@@ -27,7 +27,13 @@
 
 mod memory;
 
+#[cfg(feature = "sqlite")]
+mod sqlite;
+
 pub use memory::MemoryStateStore;
+
+#[cfg(feature = "sqlite")]
+pub use sqlite::SqliteStateStore;
 
 use crate::{Result, StageState};
 use async_trait::async_trait;
