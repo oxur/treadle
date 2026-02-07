@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
+use crate::status::{PipelineStatus, StageStatusEntry};
 use crate::{Result, Stage, StateStore, TreadleError, WorkflowEvent};
 
 /// Default channel capacity for workflow events.
@@ -316,6 +317,68 @@ impl Workflow {
 
         let ready = self.ready_stages(work_item_id, store).await?;
         Ok(ready.is_empty())
+    }
+
+    /// Returns the current status of the pipeline for a work item.
+    ///
+    /// This provides a complete snapshot of the workflow state, including
+    /// all stage statuses and subtask details.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use treadle::{Workflow, MemoryStateStore, Stage, StageContext, StageOutcome, WorkItem, Result};
+    /// # use async_trait::async_trait;
+    /// # #[derive(Debug)]
+    /// # struct TestStage;
+    /// # #[async_trait]
+    /// # impl Stage for TestStage {
+    /// #     async fn execute(&self, _item: &dyn WorkItem, _ctx: &mut StageContext) -> Result<StageOutcome> {
+    /// #         Ok(StageOutcome::Complete)
+    /// #     }
+    /// #     fn name(&self) -> &str { "test" }
+    /// # }
+    /// # #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    /// # struct Item { id: String }
+    /// # impl WorkItem for Item { fn id(&self) -> &str { &self.id } }
+    /// # async fn example() -> Result<()> {
+    /// # let workflow = Workflow::builder().stage("test", TestStage).build()?;
+    /// # let mut store = MemoryStateStore::new();
+    /// # let item = Item { id: "item-1".to_string() };
+    /// let status = workflow.status(&item.id, &store).await?;
+    /// println!("{}", status);
+    ///
+    /// if status.is_complete() {
+    ///     println!("All done!");
+    /// } else if status.has_pending_reviews() {
+    ///     for stage in status.review_stages() {
+    ///         println!("Stage {} needs review", stage);
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the state store cannot be queried.
+    pub async fn status<S: StateStore>(
+        &self,
+        work_item_id: &str,
+        store: &S,
+    ) -> Result<PipelineStatus> {
+        let all_states = store.get_all_stage_states(work_item_id).await?;
+        let mut stages = Vec::with_capacity(self.topo_order.len());
+
+        for stage_name in &self.topo_order {
+            let entry = match all_states.get(stage_name) {
+                Some(state) => StageStatusEntry::from_stage_state(stage_name, state),
+                None => StageStatusEntry::pending(stage_name),
+            };
+            stages.push(entry);
+        }
+
+        Ok(PipelineStatus::new(work_item_id, stages))
     }
 
     /// Advances a work item through the workflow.
@@ -2070,5 +2133,203 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(TreadleError::StageExecution(_))));
+    }
+
+    // Milestone 5.1 tests: Pipeline status
+
+    #[tokio::test]
+    async fn test_status_empty_workflow() {
+        let workflow = Workflow::builder().build().unwrap();
+        let store = crate::MemoryStateStore::new();
+
+        let status = workflow.status("item-1", &store).await.unwrap();
+
+        assert!(status.is_complete());
+        assert_eq!(status.progress_percent(), 100.0);
+        assert_eq!(status.stages.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_status_fresh_item() {
+        let workflow = Workflow::builder()
+            .stage("a", TestStage::new("a"))
+            .stage("b", TestStage::new("b"))
+            .stage("c", TestStage::new("c"))
+            .dependency("b", "a")
+            .dependency("c", "b")
+            .build()
+            .unwrap();
+
+        let store = crate::MemoryStateStore::new();
+
+        let status = workflow.status("item-1", &store).await.unwrap();
+
+        assert!(!status.is_complete());
+        assert_eq!(status.progress_percent(), 0.0);
+        assert_eq!(status.stages.len(), 3);
+
+        // All stages should be pending
+        for stage in &status.stages {
+            assert!(matches!(stage.status, crate::StageStatus::Pending));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_status_during_execution() {
+        let workflow = Workflow::builder()
+            .stage("a", TestStage::new("a"))
+            .stage("b", TestStage::new("b"))
+            .stage("c", TestStage::new("c"))
+            .dependency("b", "a")
+            .dependency("c", "b")
+            .build()
+            .unwrap();
+
+        let mut store = crate::MemoryStateStore::new();
+        let item = TestItem {
+            id: "item-1".to_string(),
+        };
+
+        // Execute workflow
+        workflow.advance(&item, &mut store).await.unwrap();
+
+        // Check status after completion
+        let status = workflow.status(&item.id, &store).await.unwrap();
+
+        assert!(status.is_complete());
+        assert_eq!(status.progress_percent(), 100.0);
+        assert_eq!(status.failed_stages().len(), 0);
+        assert_eq!(status.review_stages().len(), 0);
+
+        // All stages should be complete
+        for stage in &status.stages {
+            assert!(matches!(stage.status, crate::StageStatus::Complete));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_status_with_failure() {
+        #[derive(Debug)]
+        struct FailingStage {
+            name: String,
+        }
+
+        #[async_trait]
+        impl crate::Stage for FailingStage {
+            fn name(&self) -> &str {
+                &self.name
+            }
+
+            async fn execute(
+                &self,
+                _item: &dyn crate::WorkItem,
+                _ctx: &mut crate::StageContext,
+            ) -> Result<crate::StageOutcome> {
+                Err(TreadleError::StageExecution("intentional failure".to_string()))
+            }
+        }
+
+        let workflow = Workflow::builder()
+            .stage("a", TestStage::new("a"))
+            .stage("fail", FailingStage {
+                name: "fail".to_string(),
+            })
+            .stage("c", TestStage::new("c"))
+            .dependency("fail", "a")
+            .dependency("c", "fail")
+            .build()
+            .unwrap();
+
+        let mut store = crate::MemoryStateStore::new();
+        let item = TestItem {
+            id: "item-1".to_string(),
+        };
+
+        // Execute workflow (will fail at "fail" stage)
+        workflow.advance(&item, &mut store).await.unwrap();
+
+        // Check status
+        let status = workflow.status(&item.id, &store).await.unwrap();
+
+        assert!(!status.is_complete());
+        assert!(status.has_failures());
+        assert_eq!(status.failed_stages(), vec!["fail"]);
+        assert!(status.progress_percent() < 100.0);
+    }
+
+    #[tokio::test]
+    async fn test_status_with_review() {
+        #[derive(Debug)]
+        struct ReviewStage {
+            name: String,
+        }
+
+        #[async_trait]
+        impl crate::Stage for ReviewStage {
+            fn name(&self) -> &str {
+                &self.name
+            }
+
+            async fn execute(
+                &self,
+                _item: &dyn crate::WorkItem,
+                _ctx: &mut crate::StageContext,
+            ) -> Result<crate::StageOutcome> {
+                Ok(crate::StageOutcome::NeedsReview)
+            }
+        }
+
+        let workflow = Workflow::builder()
+            .stage("a", TestStage::new("a"))
+            .stage("review", ReviewStage {
+                name: "review".to_string(),
+            })
+            .stage("c", TestStage::new("c"))
+            .dependency("review", "a")
+            .dependency("c", "review")
+            .build()
+            .unwrap();
+
+        let mut store = crate::MemoryStateStore::new();
+        let item = TestItem {
+            id: "item-1".to_string(),
+        };
+
+        // Execute workflow (will pause at "review" stage)
+        workflow.advance(&item, &mut store).await.unwrap();
+
+        // Check status
+        let status = workflow.status(&item.id, &store).await.unwrap();
+
+        assert!(!status.is_complete());
+        assert!(status.has_pending_reviews());
+        assert_eq!(status.review_stages(), vec!["review"]);
+        assert!(!status.has_failures());
+    }
+
+    #[tokio::test]
+    async fn test_status_display_output() {
+        let workflow = Workflow::builder()
+            .stage("a", TestStage::new("a"))
+            .stage("b", TestStage::new("b"))
+            .build()
+            .unwrap();
+
+        let mut store = crate::MemoryStateStore::new();
+        let item = TestItem {
+            id: "doc-123".to_string(),
+        };
+
+        workflow.advance(&item, &mut store).await.unwrap();
+
+        let status = workflow.status(&item.id, &store).await.unwrap();
+        let display = format!("{}", status);
+
+        // Verify the display contains expected elements
+        assert!(display.contains("doc-123"));
+        assert!(display.contains("Pipeline status"));
+        assert!(display.contains("Progress: 100%"));
+        assert!(display.contains("Status: Complete"));
+        assert!(display.contains("✅")); // Completion emoji
     }
 }

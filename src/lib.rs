@@ -54,6 +54,7 @@ pub mod error;
 pub mod event;
 pub mod stage;
 pub mod state_store;
+pub mod status;
 pub mod work_item;
 pub mod workflow;
 
@@ -61,6 +62,7 @@ pub use error::{Result, TreadleError};
 pub use event::WorkflowEvent;
 pub use stage::{ReviewData, Stage, StageContext, StageOutcome, StageState, StageStatus, SubTask};
 pub use state_store::{MemoryStateStore, StateStore};
+pub use status::{PipelineStatus, StageStatusEntry};
 
 #[cfg(feature = "sqlite")]
 pub use state_store::SqliteStateStore;
