@@ -10,7 +10,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, info, info_span, warn, Instrument};
 
 use crate::status::{PipelineStatus, StageStatusEntry};
-use crate::{Result, Stage, StateStore, TreadleError, WorkflowEvent};
+use crate::{Result, Stage, StageStatus, StateStore, TreadleError, WorkflowEvent};
 
 /// Default channel capacity for workflow events.
 const DEFAULT_EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -664,6 +664,19 @@ impl Workflow {
             let item_id = item.id();
             let stage = self.get_stage(stage_name)?;
 
+            // Create or load stage state with subtasks
+            let mut state = store
+                .get_stage_state(item_id, stage_name)
+                .await?
+                .unwrap_or_else(crate::StageState::new);
+
+            // Initialize subtasks in state if not already present
+            if state.subtasks.is_empty() {
+                state.subtasks = subtasks.clone();
+                state.mark_in_progress();
+                store.save_stage_state(item_id, stage_name, &state).await?;
+            }
+
             // Emit fan-out started event
             let subtask_names: Vec<String> = subtasks.iter().map(|s| s.id.clone()).collect();
             self.emit(WorkflowEvent::FanOutStarted {
@@ -676,7 +689,7 @@ impl Workflow {
             let mut any_failed = false;
 
             // Execute each subtask
-            for subtask in &subtasks {
+            for (idx, subtask) in subtasks.iter().enumerate() {
                 debug!(subtask = %subtask.id, "executing subtask");
 
                 self.emit(WorkflowEvent::SubTaskStarted {
@@ -685,53 +698,64 @@ impl Workflow {
                     subtask: subtask.id.clone(),
                 });
 
-            // Build context with subtask name
-            let mut ctx = crate::StageContext::new(stage_name.to_string())
-                .with_subtask(&subtask.id);
+                // Build context with subtask name
+                let mut ctx = crate::StageContext::new(stage_name.to_string())
+                    .with_subtask(&subtask.id);
 
-            // Add a fresh stage state for the subtask context
-            ctx.stage_state = crate::StageState::new();
+                // Add a fresh stage state for the subtask context
+                ctx.stage_state = crate::StageState::new();
 
-            let result = stage.execute(item, &mut ctx).await;
+                let result = stage.execute(item, &mut ctx).await;
 
-            match result {
-                Ok(crate::StageOutcome::Complete) => {
-                    self.emit(WorkflowEvent::SubTaskCompleted {
-                        item_id: item_id.to_string(),
-                        stage: stage_name.to_string(),
-                        subtask: subtask.id.clone(),
-                    });
-                }
-                Ok(crate::StageOutcome::NeedsReview)
-                | Ok(crate::StageOutcome::Retry)
-                | Ok(crate::StageOutcome::FanOut(_)) => {
-                    // Subtasks shouldn't return these outcomes
-                    all_completed = false;
-                }
-                Ok(crate::StageOutcome::Failed) => {
-                    self.emit(WorkflowEvent::SubTaskFailed {
-                        item_id: item_id.to_string(),
-                        stage: stage_name.to_string(),
-                        subtask: subtask.id.clone(),
-                        error: "Subtask returned Failed outcome".to_string(),
-                    });
-                    any_failed = true;
-                }
-                Err(e) => {
-                    let error_msg = e.to_string();
-                    self.emit(WorkflowEvent::SubTaskFailed {
-                        item_id: item_id.to_string(),
-                        stage: stage_name.to_string(),
-                        subtask: subtask.id.clone(),
-                        error: error_msg.clone(),
-                    });
-                    any_failed = true;
+                match result {
+                    Ok(crate::StageOutcome::Complete) => {
+                        // Update subtask status in state
+                        state.subtasks[idx].status = StageStatus::Complete;
+                        store.save_stage_state(item_id, stage_name, &state).await?;
+
+                        self.emit(WorkflowEvent::SubTaskCompleted {
+                            item_id: item_id.to_string(),
+                            stage: stage_name.to_string(),
+                            subtask: subtask.id.clone(),
+                        });
+                    }
+                    Ok(crate::StageOutcome::NeedsReview)
+                    | Ok(crate::StageOutcome::Retry)
+                    | Ok(crate::StageOutcome::FanOut(_)) => {
+                        // Subtasks shouldn't return these outcomes
+                        all_completed = false;
+                    }
+                    Ok(crate::StageOutcome::Failed) => {
+                        state.subtasks[idx].status = StageStatus::Failed;
+                        state.subtasks[idx].error = Some("Subtask returned Failed outcome".to_string());
+                        store.save_stage_state(item_id, stage_name, &state).await?;
+
+                        self.emit(WorkflowEvent::SubTaskFailed {
+                            item_id: item_id.to_string(),
+                            stage: stage_name.to_string(),
+                            subtask: subtask.id.clone(),
+                            error: "Subtask returned Failed outcome".to_string(),
+                        });
+                        any_failed = true;
+                    }
+                    Err(e) => {
+                        let error_msg = e.to_string();
+                        state.subtasks[idx].status = StageStatus::Failed;
+                        state.subtasks[idx].error = Some(error_msg.clone());
+                        store.save_stage_state(item_id, stage_name, &state).await?;
+
+                        self.emit(WorkflowEvent::SubTaskFailed {
+                            item_id: item_id.to_string(),
+                            stage: stage_name.to_string(),
+                            subtask: subtask.id.clone(),
+                            error: error_msg.clone(),
+                        });
+                        any_failed = true;
+                    }
                 }
             }
-        }
 
             // Update parent stage status based on subtask outcomes
-            let mut state = crate::StageState::new();
             if any_failed {
                 warn!(failed_count = subtasks.len() - all_completed as usize, "fan-out had failures");
                 state.mark_failed("one or more subtasks failed".to_string());
@@ -839,6 +863,13 @@ impl Workflow {
                 store
                     .save_stage_state(work_item_id, stage_name, &new_state)
                     .await?;
+
+                // Emit completion event
+                self.emit(WorkflowEvent::StageCompleted {
+                    item_id: work_item_id.to_string(),
+                    stage: stage_name.to_string(),
+                });
+
                 Ok(())
             }
             Some(_) => Err(TreadleError::StageExecution(
@@ -876,11 +907,20 @@ impl Workflow {
         let current = store.get_stage_state(work_item_id, stage_name).await?;
         match current {
             Some(state) if matches!(state.status, crate::StageStatus::Paused) => {
+                let error_msg = reason.into();
                 let mut new_state = state.clone();
-                new_state.mark_failed(reason.into());
+                new_state.mark_failed(error_msg.clone());
                 store
                     .save_stage_state(work_item_id, stage_name, &new_state)
                     .await?;
+
+                // Emit failure event
+                self.emit(WorkflowEvent::StageFailed {
+                    item_id: work_item_id.to_string(),
+                    stage: stage_name.to_string(),
+                    error: error_msg,
+                });
+
                 Ok(())
             }
             Some(_) => Err(TreadleError::StageExecution(
