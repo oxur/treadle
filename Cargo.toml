@@ -1,6 +1,6 @@
 [package]
 name = "treadle"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
 description = "A persistent, resumable, human-in-the-loop workflow engine backed by a petgraph DAG"
