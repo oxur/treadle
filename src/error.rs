@@ -33,6 +33,14 @@ pub enum TreadleError {
     #[error("Stage not found: {0}")]
     StageNotFound(String),
 
+    /// Duplicate stage name in workflow.
+    #[error("Duplicate stage name: {0}")]
+    DuplicateStage(String),
+
+    /// Cycle detected in workflow DAG.
+    #[error("Cycle detected in workflow DAG")]
+    DagCycle,
+
     /// Serialization or deserialization error.
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
@@ -85,6 +93,18 @@ mod tests {
     fn test_error_display_stage_not_found() {
         let error = TreadleError::StageNotFound("scan".to_string());
         assert_eq!(error.to_string(), "Stage not found: scan");
+    }
+
+    #[test]
+    fn test_error_display_duplicate_stage() {
+        let error = TreadleError::DuplicateStage("scan".to_string());
+        assert_eq!(error.to_string(), "Duplicate stage name: scan");
+    }
+
+    #[test]
+    fn test_error_display_dag_cycle() {
+        let error = TreadleError::DagCycle;
+        assert_eq!(error.to_string(), "Cycle detected in workflow DAG");
     }
 
     #[test]

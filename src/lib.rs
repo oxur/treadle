@@ -54,6 +54,7 @@ pub mod error;
 pub mod stage;
 pub mod state_store;
 pub mod work_item;
+pub mod workflow;
 
 pub use error::{Result, TreadleError};
 pub use stage::{ReviewData, Stage, StageContext, StageOutcome, StageState, StageStatus, SubTask};
@@ -63,6 +64,7 @@ pub use state_store::{MemoryStateStore, StateStore};
 pub use state_store::SqliteStateStore;
 
 pub use work_item::WorkItem;
+pub use workflow::{Workflow, WorkflowBuilder};
 
 /// Treadle is under active development. See the README for the design
 /// and roadmap.
