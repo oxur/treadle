@@ -112,7 +112,7 @@ impl Default for StageState {
 ///
 /// Fan-out stages can spawn multiple subtasks that are tracked independently.
 /// Each subtask has its own status and retry count.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubTask {
     /// Unique identifier for this subtask.
     pub id: String,
@@ -236,6 +236,12 @@ pub enum StageOutcome {
 
     /// Stage failed permanently, do not retry.
     Failed,
+
+    /// Stage fans out into multiple parallel subtasks.
+    ///
+    /// Each subtask will be executed independently, and the stage
+    /// will only complete when all subtasks succeed.
+    FanOut(Vec<SubTask>),
 }
 
 /// Context provided to stages during execution.
@@ -252,6 +258,13 @@ pub struct StageContext {
 
     /// Optional metadata that can be used by stages.
     pub metadata: HashMap<String, serde_json::Value>,
+
+    /// Optional subtask name for fan-out stages.
+    ///
+    /// When a stage fans out into multiple subtasks, each subtask execution
+    /// receives a context with this field set to identify which subtask
+    /// is being executed.
+    pub subtask_name: Option<String>,
 }
 
 impl StageContext {
@@ -261,12 +274,19 @@ impl StageContext {
             stage_name,
             stage_state: StageState::new(),
             metadata: HashMap::new(),
+            subtask_name: None,
         }
     }
 
     /// Adds metadata to the context.
     pub fn with_metadata(mut self, key: String, value: serde_json::Value) -> Self {
         self.metadata.insert(key, value);
+        self
+    }
+
+    /// Sets the subtask name for fan-out execution.
+    pub fn with_subtask(mut self, subtask_name: impl Into<String>) -> Self {
+        self.subtask_name = Some(subtask_name.into());
         self
     }
 
