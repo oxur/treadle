@@ -1,6 +1,6 @@
 # Treadle
 
-**A persistent, resumable, human-in-the-loop workflow engine backed by a petgraph DAG.**
+*A persistent, resumable, human-in-the-loop workflow engine backed by a petgraph DAG*
 
 [![Crates.io](https://img.shields.io/crates/v/treadle.svg)](https://crates.io/crates/treadle)
 [![Documentation](https://docs.rs/treadle/badge.svg)](https://docs.rs/treadle)
