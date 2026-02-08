@@ -45,7 +45,7 @@ impl StageStatusEntry {
     pub fn from_stage_state(name: impl Into<String>, state: &StageState) -> Self {
         Self {
             name: name.into(),
-            status: state.status.clone(),
+            status: state.status,
             started_at: state.started_at,
             completed_at: state.completed_at,
             retry_count: state.retry_count,

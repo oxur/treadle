@@ -20,6 +20,7 @@ use treadle::{
 
 /// A document work item for testing.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct Document {
     id: String,
     content: String,

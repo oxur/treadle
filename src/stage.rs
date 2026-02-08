@@ -595,7 +595,7 @@ mod tests {
 
     #[test]
     fn test_stage_outcome_variants() {
-        let outcomes = vec![
+        let outcomes = [
             StageOutcome::Complete,
             StageOutcome::NeedsReview,
             StageOutcome::Retry,
