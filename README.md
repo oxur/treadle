@@ -10,9 +10,9 @@
 
 *A persistent, resumable, human-in-the-loop workflow engine backed by a petgraph DAG*
 
-> **Status: Early Development** — The API is being designed. This README
-> describes the intended architecture. Contributions and design feedback are
-> welcome.
+> **Status: v1 Complete** — The core engine is implemented and tested.
+> A v2 design adding quality gates, retry budgets, and review policies is
+> in progress. Contributions and feedback are welcome.
 
 ---
 
@@ -33,7 +33,7 @@ and show you exactly where every item stands.
 The name comes from the **treadle** — the foot-operated lever that drives a
 loom, spinning wheel, or lathe. The machine has stages and mechanisms, but
 without the human pressing the treadle, nothing moves. This captures the core
-design: a pipeline engine where human judgment gates the flow.
+design: a pipeline engine where human judgement gates the flow.
 
 ## Why Treadle?
 
@@ -69,11 +69,13 @@ pass through multiple stages. You define what a work item is by implementing
 the `WorkItem` trait:
 
 ```rust
-pub trait WorkItem: Send + Sync {
-    type Id: Clone + Eq + Hash + Display + Send + Sync;
-    fn id(&self) -> &Self::Id;
+pub trait WorkItem: Debug + Send + Sync {
+    fn id(&self) -> &str;
 }
 ```
+
+The trait is object-safe, so you can use `&dyn WorkItem` for dynamic dispatch
+across heterogeneous work item types.
 
 ### Stages
 
@@ -82,20 +84,25 @@ define what happens at each step:
 
 ```rust
 #[async_trait]
-pub trait Stage<W: WorkItem>: Send + Sync {
+pub trait Stage: Debug + Send + Sync {
     fn name(&self) -> &str;
-    async fn execute(&self, item: &W, ctx: &StageContext) -> Result<StageOutcome>;
+    async fn execute(&self, item: &dyn WorkItem, ctx: &mut StageContext) -> Result<StageOutcome>;
+
+    // Optional hooks
+    async fn before_execute(&self, item: &dyn WorkItem, ctx: &StageContext) -> Result<()> { Ok(()) }
+    async fn after_execute(&self, item: &dyn WorkItem, ctx: &StageContext, outcome: &StageOutcome) -> Result<()> { Ok(()) }
 }
 ```
 
 Stages return a `StageOutcome` indicating what happened:
 
-- **`Completed`** — Stage succeeded. Dependents can now run.
-- **`AwaitingReview(ReviewData)`** — Stage produced results that need human
-  approval before the pipeline continues.
+- **`Complete`** — Stage succeeded. Dependents can now run.
+- **`NeedsReview`** — Stage produced results that need human approval before
+  the pipeline continues.
+- **`Failed`** — Stage failed permanently.
+- **`Retry`** — Stage failed and should be retried.
 - **`FanOut(Vec<SubTask>)`** — Stage spawned multiple concurrent subtasks
   (e.g., fetching from several APIs). Each subtask is tracked independently.
-- **`Skipped`** — Stage determined it has nothing to do for this item.
 
 ### The DAG
 
@@ -105,13 +112,11 @@ build time, and an inspectable graph structure for status display:
 
 ```rust
 let workflow = Workflow::builder()
-    .stage("scan", ScanStage::new())
-    .stage("identify", IdentifyStage::new())
-    .stage("enrich", EnrichStage::new(sources))
-    .stage("review", ReviewStage::new(rules))
-    .stage("export", ExportStage::new())
-    .dependency("identify", "scan")
-    .dependency("enrich", "identify")
+    .stage("scan", ScanStage)
+    .stage("enrich", EnrichStage)
+    .stage("review", ReviewStage)
+    .stage("export", ExportStage)
+    .dependency("enrich", "scan")
     .dependency("review", "enrich")
     .dependency("export", "review")
     .build()?;
@@ -125,26 +130,36 @@ be implemented for any backend:
 
 ```rust
 #[async_trait]
-pub trait StateStore<W: WorkItem>: Send + Sync {
-    async fn get_status(&self, item_id: &W::Id, stage: &str) -> Result<Option<StageStatus>>;
-    async fn set_status(&self, item_id: &W::Id, stage: &str, status: StageStatus) -> Result<()>;
-    async fn query_items(&self, stage: &str, state: StageState) -> Result<Vec<W::Id>>;
+pub trait StateStore: Send + Sync {
+    async fn save_stage_state(&mut self, item_id: &str, stage: &str, state: &StageState) -> Result<()>;
+    async fn get_stage_state(&self, item_id: &str, stage: &str) -> Result<Option<StageState>>;
+    async fn get_all_stage_states(&self, item_id: &str) -> Result<HashMap<String, StageState>>;
+    async fn save_work_item_data(&mut self, item_id: &str, data: &JsonValue) -> Result<()>;
+    async fn get_work_item_data(&self, item_id: &str) -> Result<Option<JsonValue>>;
+    async fn delete_work_item(&mut self, item_id: &str) -> Result<()>;
+    async fn list_work_items(&self) -> Result<Vec<String>>;
 }
 ```
+
+Two implementations are provided:
+
+- **`MemoryStateStore`** — thread-safe, in-memory store for testing and
+  development.
+- **`SqliteStateStore`** — persistent SQLite-backed store with automatic
+  schema migration (enabled via the `sqlite` feature, on by default).
 
 This means:
 
 - If the process crashes, you resume from where you left off.
-- You can query "show me all items awaiting review" or "what failed at the
-  enrich stage" at any time.
-- `treadle status` (in your CLI) can show the full pipeline state.
+- You can query the full state of any work item at any time.
+- Pipeline status can be displayed in your CLI or TUI.
 
 ### Human-in-the-Loop Review Gates
 
-When a stage returns `StageOutcome::AwaitingReview`, the pipeline pauses for
-that work item. The item sits in the review state until a human explicitly
-approves, edits, or rejects it. This is first-class in the engine, not a
-workaround.
+When a stage returns `StageOutcome::NeedsReview`, the pipeline pauses for
+that work item. The item sits in review until a human explicitly approves or
+rejects it via `workflow.approve_review()` or `workflow.reject_review()`.
+This is first-class in the engine, not a workaround.
 
 ### Fan-Out with Per-Subtask Tracking
 
@@ -161,16 +176,28 @@ Your TUI, CLI, or logging layer subscribes to these events for real-time
 visibility:
 
 ```rust
-pub enum WorkflowEvent<W: WorkItem> {
-    StageStarted { item_id: W::Id, stage: String },
-    StageCompleted { item_id: W::Id, stage: String },
-    StageFailed { item_id: W::Id, stage: String, error: String },
-    ReviewRequired { item_id: W::Id, stage: String, data: ReviewData },
-    SubTaskStarted { item_id: W::Id, stage: String, subtask: String },
-    SubTaskCompleted { item_id: W::Id, stage: String, subtask: String },
-    SubTaskFailed { item_id: W::Id, stage: String, subtask: String, error: String },
+#[non_exhaustive]
+pub enum WorkflowEvent {
+    StageStarted { item_id: String, stage: String },
+    StageCompleted { item_id: String, stage: String },
+    StageFailed { item_id: String, stage: String, error: String },
+    ReviewRequired { item_id: String, stage: String, data: ReviewData },
+    StageSkipped { item_id: String, stage: String },
+    StageRetried { item_id: String, stage: String },
+    FanOutStarted { item_id: String, stage: String, subtasks: Vec<String> },
+    SubTaskStarted { item_id: String, stage: String, subtask: String },
+    SubTaskCompleted { item_id: String, stage: String, subtask: String },
+    SubTaskFailed { item_id: String, stage: String, subtask: String, error: String },
+    WorkflowCompleted { item_id: String },
 }
 ```
+
+### Pipeline Status
+
+The `PipelineStatus` type provides a complete snapshot of a work item's
+progress through the workflow, including per-stage status, timing, retry
+counts, and subtask details. It supports progress percentage calculation and
+has a built-in `Display` implementation for quick inspection.
 
 ## Design Principles
 
@@ -180,17 +207,17 @@ pub enum WorkflowEvent<W: WorkItem> {
 
 2. **The human is part of the pipeline.** Review gates are a first-class
    concept, not an afterthought. The engine is designed around the assumption
-   that some stages need human judgment.
+   that some stages need human judgement.
 
 3. **Visibility over magic.** Every piece of state is inspectable. You can
    always answer "where is this item in the pipeline, what happened at each
    stage, and why did this fail?" The event stream makes real-time
    observation trivial.
 
-4. **Bring your own resilience.** Treadle tracks state and executes stages,
-   but it doesn't impose retry or circuit-breaker policies. Your stage
-   implementations use whatever resilience strategy fits (backon, failsafe,
-   custom logic). The engine records what happened.
+4. **Resilience is explicit.** The engine provides manual retry support
+   (`retry_stage()`) and tracks retry counts per stage. Stage implementations
+   can use whatever internal resilience strategy fits. v2 will add
+   configurable retry budgets and quality gates for automatic retry loops.
 
 5. **Stages are the unit of abstraction.** Implementing a new stage is
    implementing a trait. Adding a stage to the pipeline is adding a node and
@@ -200,7 +227,7 @@ pub enum WorkflowEvent<W: WorkItem> {
    in batches), tracking each independently. New items can enter the pipeline
    at any time. Items at different stages coexist naturally.
 
-## Intended Architecture
+## Architecture
 
 ```
 ┌──────────────────────────────────────────────────┐
@@ -227,57 +254,80 @@ pub enum WorkflowEvent<W: WorkItem> {
 │  └────────────────────────────────────────────┘  │
 │                                                  │
 │  ┌────────────────────────────────────────────┐  │
-│  │  StateStore (SQLite / custom)              │  │
+│  │  StateStore (SQLite / in-memory / custom)  │  │
 │  │  item × stage × subtask → status           │  │
 │  └────────────────────────────────────────────┘  │
 └──────────────────────────────────────────────────┘
 ```
 
-## Usage Example (Planned API)
+## Quick Start
+
+Add Treadle to your `Cargo.toml`:
+
+```toml
+[dependencies]
+treadle = "0.2"
+```
+
+## Usage Example
 
 ```rust
-use treadle::{Workflow, Stage, StageOutcome, StageContext, StateStore};
-use treadle::state::SqliteStateStore;
+use treadle::{
+    Workflow, Stage, StageOutcome, StageContext, WorkItem,
+    MemoryStateStore, ReviewData, Result,
+};
+use async_trait::async_trait;
 
 // Define a work item
-#[derive(Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct Document {
     id: String,
-    path: PathBuf,
+    path: String,
 }
 
-impl treadle::WorkItem for Document {
-    type Id = String;
-    fn id(&self) -> &String { &self.id }
+impl WorkItem for Document {
+    fn id(&self) -> &str { &self.id }
 }
 
 // Implement stages
+#[derive(Debug)]
 struct ParseStage;
 
 #[async_trait]
-impl Stage<Document> for ParseStage {
+impl Stage for ParseStage {
     fn name(&self) -> &str { "parse" }
-    async fn execute(&self, item: &Document, ctx: &StageContext) -> Result<StageOutcome> {
+    async fn execute(&self, _item: &dyn WorkItem, _ctx: &mut StageContext) -> Result<StageOutcome> {
         // ... parse the document ...
-        Ok(StageOutcome::Completed)
+        Ok(StageOutcome::Complete)
     }
 }
 
+#[derive(Debug)]
 struct ReviewStage;
 
 #[async_trait]
-impl Stage<Document> for ReviewStage {
+impl Stage for ReviewStage {
     fn name(&self) -> &str { "review" }
-    async fn execute(&self, item: &Document, ctx: &StageContext) -> Result<StageOutcome> {
-        let data = ReviewData::new("Parsed content ready for review");
-        Ok(StageOutcome::AwaitingReview(data))
+    async fn execute(&self, item: &dyn WorkItem, _ctx: &mut StageContext) -> Result<StageOutcome> {
+        Ok(StageOutcome::NeedsReview)
+    }
+}
+
+#[derive(Debug)]
+struct ExportStage;
+
+#[async_trait]
+impl Stage for ExportStage {
+    fn name(&self) -> &str { "export" }
+    async fn execute(&self, _item: &dyn WorkItem, _ctx: &mut StageContext) -> Result<StageOutcome> {
+        Ok(StageOutcome::Complete)
     }
 }
 
 // Build and run
 #[tokio::main]
 async fn main() -> Result<()> {
-    let state = SqliteStateStore::open("pipeline.db").await?;
+    let mut store = MemoryStateStore::new();
 
     let workflow = Workflow::builder()
         .stage("parse", ParseStage)
@@ -297,47 +347,71 @@ async fn main() -> Result<()> {
 
     // Process an item — advances through all eligible stages
     let doc = Document { id: "doc-1".into(), path: "report.pdf".into() };
-    workflow.advance(&doc, &state).await?;
+    workflow.advance(&doc, &mut store).await?;
+    // parse completes, review pauses for human judgement
 
     // Later: approve the review and continue
-    state.set_status(&doc.id, "review", StageStatus::completed()).await?;
-    workflow.advance(&doc, &state).await?;
+    workflow.approve_review(doc.id(), "review", &mut store).await?;
+    workflow.advance(&doc, &mut store).await?;
+    // export completes
 
     Ok(())
 }
 ```
+
+See [`examples/basic_pipeline.rs`](examples/basic_pipeline.rs) for a more
+complete example with event streaming, status display, and fan-out stages.
 
 ## Target Use Cases
 
 - **Media processing pipelines** — scan files, identify metadata, enrich
   from external sources, review, export. (This is the motivating use case:
   [tessitura](https://github.com/TODO/tessitura), a musicological library
-  cataloging tool.)
+  cataloguing tool.)
+- **AI agent pipelines** — LLM-driven document processing with quality gates
+  and human review for confidence thresholds.
 - **Data migration / ETL tools** — extract records, transform, validate
   with human review, load.
 - **Document processing** — parse, classify, review, archive.
 - **Content moderation pipelines** — ingest, auto-classify, flag for human
   review, publish or reject.
 - **Any CLI tool** where items flow through stages, some stages need human
-  judgment, and you need the pipeline to survive restarts.
+  judgement, and you need the pipeline to survive restarts.
 
 ## Related Projects
 
-For why this project was created and a brief overview of related projects in the Rust ecosystem, be sure to check out:
+For why this project was created and a brief overview of related projects in
+the Rust ecosystem, be sure to check out:
 
 - [Rust DAG/workflow/pipeline Projects](./docs/related-projects.md)
 
 ## Roadmap
 
-- [ ] Core traits: `WorkItem`, `Stage`, `StageOutcome`, `StateStore`
-- [ ] petgraph-backed `Workflow` with builder pattern and DAG validation
-- [ ] SQLite `StateStore` implementation
-- [ ] In-memory `StateStore` for testing
-- [ ] Workflow executor with topological stage ordering
-- [ ] Fan-out with per-subtask state tracking
-- [ ] Event stream via tokio broadcast channel
-- [ ] Pipeline status/visualization helpers
-- [ ] Documentation and examples
+### v1 (Complete)
+
+- [x] Core traits: `WorkItem`, `Stage`, `StageOutcome`, `StateStore`
+- [x] petgraph-backed `Workflow` with builder pattern and DAG validation
+- [x] SQLite `StateStore` implementation
+- [x] In-memory `StateStore` for testing
+- [x] Workflow executor with topological stage ordering
+- [x] Fan-out with per-subtask state tracking
+- [x] Event stream via tokio broadcast channel
+- [x] Pipeline status and visualisation helpers
+- [x] Human review gates with approve/reject
+- [x] Manual retry support for failed stages
+- [x] Documentation and examples
+
+### v2 (In Progress)
+
+- [ ] `Artefact` trait and typed artefact passing between stages
+- [ ] `QualityGate` trait for automated output evaluation
+- [ ] `RetryBudget` with configurable attempts, delays, and timeouts
+- [ ] `ReviewPolicy` (Never, Always, OnEscalation, OnUncertain,
+  OnEscalationOrUncertain)
+- [ ] `ReviewOutcome` with ApproveWithEdits support
+- [ ] Automatic retry loop with quality feedback threading
+- [ ] Attempt history and structured quality feedback
+- [ ] Integration tests and updated documentation
 
 ## License
 
