@@ -22,12 +22,15 @@ RUST_VERSION := $(shell rustc --version 2>/dev/null || echo "unknown")
 # Default target
 .DEFAULT_GOAL := help
 
+# Git remotes to push to
+GIT_REMOTES := macpro github codeberg
+
 # Help target
 .PHONY: help
 help:
 	@echo ""
 	@echo "$(CYAN)╔══════════════════════════════════════════════════════════╗$(RESET)"
-	@echo "$(CYAN)║$(RESET) $(BLUE)$(PROJECT_NAME) Build System$(RESET)                                   $(CYAN)║$(RESET)"
+	@echo "$(CYAN)║$(RESET) $(BLUE)$(PROJECT_NAME) Build System$(RESET)                                     $(CYAN)║$(RESET)"
 	@echo "$(CYAN)╚══════════════════════════════════════════════════════════╝$(RESET)"
 	@echo ""
 	@echo "$(GREEN)Building:$(RESET)"
@@ -49,7 +52,7 @@ help:
 	@echo ""
 	@echo "$(GREEN)Utilities:$(RESET)"
 	@echo "  $(YELLOW)make push$(RESET)             - Pushes to Codeberg and Github"
-	@echo "  $(YELLOW)make publish$(RESET)          - WIP: Publishes all crates to crates.io"
+	@echo "  $(YELLOW)make publish$(RESET)          - Publishes to crates.io"
 	@echo "  $(YELLOW)make tracked-files$(RESET)    - Save list of tracked files"
 	@echo ""
 	@echo "$(GREEN)Information:$(RESET)"
@@ -235,9 +238,8 @@ tracked-files:
 
 push:
 	@echo "$(BLUE)Pushing changes ...$(RESET)"
-	@echo "$(CYAN)• Codeberg:$(RESET)"
-	@git push codeberg main && git push codeberg --tags
-	@echo "$(GREEN)✓ Pushed$(RESET)"
-	@echo "$(CYAN)• Github:$(RESET)"
-	@git push github main && git push github --tags
-	@echo "$(GREEN)✓ Pushed$(RESET)"
+	@for remote in $(GIT_REMOTES); do \
+		echo "$(CYAN)• $$remote:$(RESET)"; \
+		git push $$remote main && git push $$remote --tags; \
+		echo "$(GREEN)✓ Pushed$(RESET)"; \
+	done
