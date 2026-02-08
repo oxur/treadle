@@ -1,10 +1,14 @@
 # Treadle
 
-*A persistent, resumable, human-in-the-loop workflow engine backed by a petgraph DAG*
-
-[![Crates.io](https://img.shields.io/crates/v/treadle.svg)](https://crates.io/crates/treadle)
-[![Documentation](https://docs.rs/treadle/badge.svg)](https://docs.rs/treadle)
+[![][build-badge]][build]
+[![][crate-badge]][crate]
+[![][tag-badge]][tag]
+[![][docs-badge]][docs]
 [![License](https://img.shields.io/crates/l/treadle.svg)](LICENSE-MIT)
+
+[![][logo]][logo-large]
+
+*A persistent, resumable, human-in-the-loop workflow engine backed by a petgraph DAG*
 
 > **Status: Early Development** — The API is being designed. This README
 > describes the intended architecture. Contributions and design feedback are
@@ -405,3 +409,16 @@ Licensed under either of
   <http://opensource.org/licenses/MIT>)
 
 at your option.
+
+[//]: ---Named-Links---
+
+[logo]: assets/images/logo/v1-x250.png
+[logo-large]: assets/images/logo/v1.png
+[build]: https://github.com/oxur/treadle/actions/workflows/ci.yml
+[build-badge]: https://github.com/oxur/treadle/actions/workflows/ci.yml/badge.svg
+[crate]: https://crates.io/crates/treadle
+[crate-badge]: https://img.shields.io/crates/v/treadle.svg
+[docs]: https://docs.rs/treadle/
+[docs-badge]: https://img.shields.io/badge/rust-documentation-blue.svg
+[tag-badge]: https://img.shields.io/github/tag/oxur/treadle.svg
+[tag]: https://github.com/oxur/treadle/tags
