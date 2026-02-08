@@ -42,7 +42,7 @@ use std::fmt::Debug;
 ///     }
 /// }
 /// ```
-pub trait WorkItem: Debug {
+pub trait WorkItem: Debug + Send + Sync {
     /// Returns the unique identifier for this work item.
     ///
     /// This ID is used to track the item's progress through the workflow
